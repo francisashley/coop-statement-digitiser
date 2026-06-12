@@ -19,6 +19,13 @@ interface StatementData {
   transactions: Transaction[]
 }
 
+interface StatementFile {
+  filename: string
+  number: number
+  data: StatementData
+  missing: boolean
+}
+
 type ImportTransaction =
   | {
       type: 'income'
@@ -33,6 +40,13 @@ type ImportTransaction =
       description?: string
       sent_amount: number
       sent_currency: string
+    }
+  | {
+      type: 'adjustment'
+      date: string
+      description?: string
+      amount: number
+      currency: string
     }
 
 const inputPath = join(process.cwd(), 'input')
@@ -67,13 +81,79 @@ for (const [account, files] of accountsMap) {
     return numA - numB
   })
 
-  const allTransactions: ImportTransaction[] = []
-
-  for (const jsonFile of sortedFiles) {
-    const filePath = join(inputPath, jsonFile)
+  const statementFiles: StatementFile[] = sortedFiles.map((filename) => {
+    const num = parseInt(filename.match(/-(\d+)\.json$/)?.[1] || '0')
+    const filePath = join(inputPath, filename)
     const data: StatementData = JSON.parse(readFileSync(filePath, 'utf-8'))
+    return { filename, number: num, data, missing: false }
+  })
 
-    for (const t of data.transactions) {
+  const existingNumbers = statementFiles.map((s) => s.number)
+  const minNumber = Math.min(...existingNumbers)
+  const maxNumber = Math.max(...existingNumbers)
+
+  for (let num = minNumber; num <= maxNumber; num++) {
+    if (!existingNumbers.includes(num)) {
+      statementFiles.push({
+        filename: `${account}-${String(num).padStart(3, '0')}.json`,
+        number: num,
+        data: {
+          summary: { statementDate: null, statementNumber: num, openingBalance: null, closingBalance: null },
+          transactions: [],
+        },
+        missing: true,
+      })
+    }
+  }
+
+  statementFiles.sort((a, b) => a.number - b.number)
+
+  const allTransactions: ImportTransaction[] = []
+  let adjustmentCount = 0
+
+  for (let i = 0; i < statementFiles.length; i++) {
+    const stmt = statementFiles[i]
+
+    if (stmt.missing) {
+      const isFirstMissing = i === 0 || !statementFiles[i - 1].missing
+      if (!isFirstMissing) continue
+
+      const prevStmt = i > 0 ? statementFiles[i - 1] : null
+      let missingEnd = i
+      while (missingEnd < statementFiles.length - 1 && statementFiles[missingEnd + 1].missing) {
+        missingEnd++
+      }
+      const nextStmt = missingEnd < statementFiles.length - 1 ? statementFiles[missingEnd + 1] : null
+
+      if (prevStmt && nextStmt) {
+        const prevClosing = prevStmt.data.summary.closingBalance
+        const nextOpening = nextStmt.data.summary.openingBalance
+        const adjustmentDate = nextStmt.data.transactions[0]?.date || nextStmt.data.summary.statementDate
+
+        const missingNumbers = statementFiles.slice(i, missingEnd + 1).map((s) => s.number)
+        const rangeStr =
+          missingNumbers.length === 1
+            ? `statement ${missingNumbers[0]}`
+            : `statements ${missingNumbers[0]}-${missingNumbers[missingNumbers.length - 1]}`
+
+        if (prevClosing !== null && nextOpening !== null && adjustmentDate) {
+          const delta = Math.round((nextOpening - prevClosing) * 100) / 100
+          const description = `ADJUSTMENT (${rangeStr} missing)`
+
+          allTransactions.push({
+            type: 'adjustment',
+            date: adjustmentDate,
+            description,
+            amount: delta,
+            currency: 'Fiat:GBP',
+          })
+          adjustmentCount++
+        }
+      }
+      continue
+    }
+
+    for (const t of stmt.data.transactions) {
       if (!t.date) continue
 
       if (t.moneyIn !== null && t.moneyIn > 0) {
@@ -98,5 +178,7 @@ for (const [account, files] of accountsMap) {
 
   const exportFilePath = join(outputPath, `${account}-megistus-export.json`)
   writeFileSync(exportFilePath, JSON.stringify(allTransactions, null, 2) + '\n')
-  console.log(`${account}: exported ${allTransactions.length} transactions to ${exportFilePath}`)
+  console.log(
+    `${account}: exported ${allTransactions.length} transactions (${adjustmentCount} adjustments) to ${exportFilePath}`,
+  )
 }

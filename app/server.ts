@@ -61,6 +61,7 @@ interface Statement {
     valid: boolean
     issues: DateValidationIssue[]
   }
+  missing?: boolean
 }
 
 const createEmptyStatementData = (): StatementData => ({
@@ -93,9 +94,7 @@ const loadStatements = (): Statement[] => {
   const sourceExts = ['.jpg', '.jpeg', '.pdf', '.png']
   const allFiles = readdirSync(BASE_PATH)
 
-  const sourceFiles = allFiles.filter((filename) =>
-    sourceExts.some((ext) => filename.endsWith(ext))
-  )
+  const sourceFiles = allFiles.filter((filename) => sourceExts.some((ext) => filename.endsWith(ext)))
 
   for (const sourceFile of sourceFiles) {
     const match = sourceFile.match(/^([a-z]+)-(\d+)\.(jpg|jpeg|pdf|png)$/i)
@@ -191,6 +190,39 @@ const loadStatements = (): Statement[] => {
   return statements
 }
 
+const addMissingStatements = (statements: Statement[]): void => {
+  const accounts = [...new Set(statements.map((s) => s.account))]
+
+  for (const account of accounts) {
+    const accountStatements = statements.filter((s) => s.account === account)
+    const existingNumbers = accountStatements.map((s) => parseInt(s.statementNumber))
+    const maxNumber = Math.max(...existingNumbers)
+    const minNumber = Math.min(...existingNumbers)
+
+    for (let num = minNumber; num <= maxNumber; num++) {
+      if (!existingNumbers.includes(num)) {
+        const paddedNum = String(num).padStart(3, '0')
+        statements.push({
+          id: `${account}-${paddedNum}`,
+          account,
+          statementNumber: paddedNum,
+          sourcePath: '',
+          jsonPath: '',
+          data: createEmptyStatementData(),
+          dateValidation: { valid: true, issues: [] },
+          missing: true,
+        })
+      }
+    }
+  }
+
+  statements.sort((a, b) => {
+    const accountCompare = a.account.localeCompare(b.account)
+    if (accountCompare !== 0) return accountCompare
+    return parseInt(a.statementNumber) - parseInt(b.statementNumber)
+  })
+}
+
 const computeDateValidation = (statements: Statement[]): void => {
   const accounts = [...new Set(statements.map((s) => s.account))]
 
@@ -205,7 +237,9 @@ const computeDateValidation = (statements: Statement[]): void => {
 
       const issues: DateValidationIssue[] = []
       const statementDate = stmt.data.summary.statementDate ? new Date(stmt.data.summary.statementDate) : null
-      const prevStatementDate = prevStmt?.data.summary.statementDate ? new Date(prevStmt.data.summary.statementDate) : null
+      const prevStatementDate = prevStmt?.data.summary.statementDate
+        ? new Date(prevStmt.data.summary.statementDate)
+        : null
 
       for (let t = 0; t < stmt.data.transactions.length; t++) {
         const tx = stmt.data.transactions[t]
@@ -491,6 +525,10 @@ const generateHTML = (): string => {
             .statement-item .signed-off-indicator {
               font-size: 12px;
               color: #6fcf6f;
+            }
+            .statement-item .missing-indicator {
+              font-size: 12px;
+              color: #cfaf6f;
             }
 
             .main-content {
@@ -1262,6 +1300,7 @@ const generateHTML = (): string => {
             };
 
             const getAlertReasons = (statement) => {
+              if (statement.missing) return [];
               const reasons = [];
               if (!statement.data.validation.valid) {
                 reasons.push('Invalid calculation');
@@ -1295,7 +1334,11 @@ const generateHTML = (): string => {
                   ? \`<span class="alert-indicator">\${alertReasons.length}</span>\`
                   : '';
 
-                const signedOffIndicator = !hasAlerts && isFullySignedOff(statement)
+                const missingIndicator = statement.missing
+                  ? '<span class="missing-indicator">✓</span>'
+                  : '';
+
+                const signedOffIndicator = !statement.missing && !hasAlerts && isFullySignedOff(statement)
                   ? '<span class="signed-off-indicator">✓</span>'
                   : '';
 
@@ -1304,6 +1347,7 @@ const generateHTML = (): string => {
                     <span class="status-dot \${statusDotClass}"></span>
                     <span class="num">#\${statement.statementNumber}</span>
                     <span class="account-label">\${statement.account}</span>
+                    \${missingIndicator}
                     \${signedOffIndicator}
                     \${alertIndicator}
                   </div>
@@ -1348,6 +1392,7 @@ const generateHTML = (): string => {
             };
 
             const hasIssues = (statement) => {
+              if (statement.missing) return false;
               if (!statement.data.validation.valid) return true;
               const mismatches = getBalanceMismatches(statement);
               if (mismatches.length > 0) return true;
@@ -1412,6 +1457,36 @@ const generateHTML = (): string => {
               const posInFiltered = filteredIndices.indexOf(currentIndex);
 
               history.replaceState(null, '', '#' + statement.id);
+
+              if (statement.missing) {
+                elements.sourcePanel.innerHTML = \`
+                  <div class="source-header">
+                    <button class="sidebar-toggle" id="source-sidebar-toggle">☰</button>
+                    <span class="title">Source</span>
+                    <span class="spacer"></span>
+                    <div class="nav-controls">
+                      <button class="nav-btn" id="prev-btn" \${posInFiltered <= 0 ? 'disabled' : ''}>←</button>
+                      <span class="nav-counter">\${posInFiltered + 1} / \${filteredIndices.length}</span>
+                      <button class="nav-btn" id="next-btn" \${posInFiltered >= filteredIndices.length - 1 ? 'disabled' : ''}>→</button>
+                    </div>
+                  </div>
+                  <div class="source-main">
+                    <p style="padding: 20px; color: #cfaf6f;">Statement #\${statement.statementNumber} is missing</p>
+                  </div>
+                \`;
+                elements.dataSection.innerHTML = \`
+                  <div class="panel-header">
+                    <h3>Statement #\${statement.statementNumber}</h3>
+                  </div>
+                  <div class="date-warning" style="text-align: center; padding: 40px 20px;">
+                    <strong>This statement is missing</strong>
+                    <p style="margin-top: 10px; color: #aaa;">No source document available. An adjustment transaction will be generated on export if needed.</p>
+                  </div>
+                \`;
+                setupSourceTabs();
+                renderStatementList();
+                return;
+              }
 
               const hasSource = !!statement.sourcePath;
               const isImage = hasSource && /\\.(jpg|jpeg|png)$/i.test(statement.sourcePath);
@@ -2252,8 +2327,10 @@ const getMimeType = (path: string): string => {
 }
 
 const statements = loadStatements()
+addMissingStatements(statements)
 computeDateValidation(statements)
-console.log(`Loaded ${statements.length} statements`)
+const missingCount = statements.filter((s) => s.missing).length
+console.log(`Loaded ${statements.length} statements (${missingCount} missing)`)
 console.log(`  Valid: ${statements.filter((statement) => statement.data.validation.valid).length}`)
 console.log(`  Invalid: ${statements.filter((statement) => !statement.data.validation.valid).length}`)
 
@@ -2332,7 +2409,9 @@ const server = createServer((req, res) => {
 
         const signedOffInstructions =
           Object.keys(signedOffData).length > 0
-            ? `\n\nIMPORTANT: The following fields have been verified by the user. You MUST use these EXACT values and NOT extract them from the image:\n${Object.entries(signedOffData)
+            ? `\n\nIMPORTANT: The following fields have been verified by the user. You MUST use these EXACT values and NOT extract them from the image:\n${Object.entries(
+                signedOffData,
+              )
                 .map(([field, value]) => `- ${field}: ${JSON.stringify(value)}`)
                 .join('\n')}`
             : ''
@@ -2442,7 +2521,9 @@ Rules:
                 if (transaction.moneyOut !== null) totalOut += transaction.moneyOut
               }
               const calculatedClosing =
-                summary.openingBalance !== null ? Math.round((summary.openingBalance + totalIn - totalOut) * 100) / 100 : null
+                summary.openingBalance !== null
+                  ? Math.round((summary.openingBalance + totalIn - totalOut) * 100) / 100
+                  : null
               const difference =
                 calculatedClosing !== null && summary.closingBalance !== null
                   ? Math.round((calculatedClosing - summary.closingBalance) * 100) / 100
@@ -2464,7 +2545,14 @@ Rules:
               const totalCost = inputCost + outputCost
 
               res.writeHead(200, { 'Content-Type': 'application/json' })
-              res.end(JSON.stringify({ ok: true, data: statement.data, dateValidation: statement.dateValidation, cost: totalCost.toFixed(4) }))
+              res.end(
+                JSON.stringify({
+                  ok: true,
+                  data: statement.data,
+                  dateValidation: statement.dateValidation,
+                  cost: totalCost.toFixed(4),
+                }),
+              )
             } catch (err) {
               res.writeHead(200, { 'Content-Type': 'application/json' })
               res.end(JSON.stringify({ error: 'Failed to parse response: ' + (err as Error).message }))
