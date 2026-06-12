@@ -42,6 +42,14 @@ interface StatementData {
   meta: StatementMeta
 }
 
+interface DateValidationIssue {
+  transactionIndex: number
+  transactionDate: string
+  description: string
+  issue: 'after_statement' | 'before_previous'
+  referenceDate: string
+}
+
 interface Statement {
   id: string
   account: string
@@ -49,6 +57,10 @@ interface Statement {
   sourcePath: string
   jsonPath: string
   data: StatementData
+  dateValidation: {
+    valid: boolean
+    issues: DateValidationIssue[]
+  }
 }
 
 const createEmptyStatementData = (): StatementData => ({
@@ -172,10 +184,62 @@ const loadStatements = (): Statement[] => {
       sourcePath,
       jsonPath: jsonFile,
       data,
+      dateValidation: { valid: true, issues: [] },
     })
   }
 
   return statements
+}
+
+const computeDateValidation = (statements: Statement[]): void => {
+  const accounts = [...new Set(statements.map((s) => s.account))]
+
+  for (const account of accounts) {
+    const accountStatements = statements
+      .filter((s) => s.account === account)
+      .sort((a, b) => parseInt(a.statementNumber) - parseInt(b.statementNumber))
+
+    for (let i = 0; i < accountStatements.length; i++) {
+      const stmt = accountStatements[i]
+      const prevStmt = i > 0 ? accountStatements[i - 1] : null
+
+      const issues: DateValidationIssue[] = []
+      const statementDate = stmt.data.summary.statementDate ? new Date(stmt.data.summary.statementDate) : null
+      const prevStatementDate = prevStmt?.data.summary.statementDate ? new Date(prevStmt.data.summary.statementDate) : null
+
+      for (let t = 0; t < stmt.data.transactions.length; t++) {
+        const tx = stmt.data.transactions[t]
+        if (!tx.date) continue
+
+        const txDate = new Date(tx.date)
+
+        if (statementDate && txDate > statementDate) {
+          issues.push({
+            transactionIndex: t,
+            transactionDate: tx.date,
+            description: tx.description || '',
+            issue: 'after_statement',
+            referenceDate: stmt.data.summary.statementDate!,
+          })
+        }
+
+        if (prevStatementDate && txDate < prevStatementDate) {
+          issues.push({
+            transactionIndex: t,
+            transactionDate: tx.date,
+            description: tx.description || '',
+            issue: 'before_previous',
+            referenceDate: prevStmt!.data.summary.statementDate!,
+          })
+        }
+      }
+
+      stmt.dateValidation = {
+        valid: issues.length === 0,
+        issues,
+      }
+    }
+  }
 }
 
 const generateHTML = (): string => {
@@ -881,6 +945,22 @@ const generateHTML = (): string => {
               font-family: monospace;
             }
 
+            .date-warning {
+              background: #3d2a1a;
+              color: #cfaf6f;
+              padding: 8px 12px;
+              margin-bottom: 12px;
+              border-radius: 4px;
+              font-size: 12px;
+            }
+            .date-warning ul {
+              margin: 6px 0 0 0;
+              padding-left: 20px;
+            }
+            .date-warning li {
+              margin: 2px 0;
+            }
+
             .row-actions {
               width: 30px;
             }
@@ -1190,6 +1270,9 @@ const generateHTML = (): string => {
               if (mismatches.length > 0) {
                 reasons.push(mismatches.length + ' balance mismatch' + (mismatches.length > 1 ? 'es' : ''));
               }
+              if (statement.dateValidation && !statement.dateValidation.valid) {
+                reasons.push(statement.dateValidation.issues.length + ' date issue' + (statement.dateValidation.issues.length > 1 ? 's' : ''));
+              }
               return reasons;
             };
 
@@ -1207,11 +1290,12 @@ const generateHTML = (): string => {
                 const statusDotClass = status === 'viewed' ? 'viewed' : 'pending';
 
                 const alertReasons = getAlertReasons(statement);
-                const alertIndicator = alertReasons.length > 0
+                const hasAlerts = alertReasons.length > 0;
+                const alertIndicator = hasAlerts
                   ? \`<span class="alert-indicator">\${alertReasons.length}</span>\`
                   : '';
 
-                const signedOffIndicator = isFullySignedOff(statement)
+                const signedOffIndicator = !hasAlerts && isFullySignedOff(statement)
                   ? '<span class="signed-off-indicator">✓</span>'
                   : '';
 
@@ -1266,7 +1350,9 @@ const generateHTML = (): string => {
             const hasIssues = (statement) => {
               if (!statement.data.validation.valid) return true;
               const mismatches = getBalanceMismatches(statement);
-              return mismatches.length > 0;
+              if (mismatches.length > 0) return true;
+              if (statement.dateValidation && !statement.dateValidation.valid) return true;
+              return false;
             };
 
             const formatValue = (value) => {
@@ -1455,6 +1541,18 @@ const generateHTML = (): string => {
                     return '<div class="balance-warning">' + mismatches.length + ' row balance' + (mismatches.length > 1 ? 's do' : ' does') + ' not match computed value</div>';
                   }
                   return '';
+                })()}
+                \${(() => {
+                  if (!statement.dateValidation || statement.dateValidation.valid) return '';
+                  const issues = statement.dateValidation.issues;
+                  const items = issues.map(issue => {
+                    if (issue.issue === 'after_statement') {
+                      return '<li>Row ' + (issue.transactionIndex + 1) + ': ' + escapeHtml(issue.transactionDate) + ' is after statement date ' + escapeHtml(issue.referenceDate) + '</li>';
+                    } else {
+                      return '<li>Row ' + (issue.transactionIndex + 1) + ': ' + escapeHtml(issue.transactionDate) + ' is before previous statement date ' + escapeHtml(issue.referenceDate) + '</li>';
+                    }
+                  }).join('');
+                  return '<div class="date-warning"><strong>' + issues.length + ' date issue' + (issues.length > 1 ? 's' : '') + ':</strong><ul>' + items + '</ul></div>';
                 })()}
 
                 <div class="transactions-header">
@@ -1842,11 +1940,15 @@ const generateHTML = (): string => {
             };
 
             const saveStatement = async (statement) => {
-              await fetch('/api/statements/' + statement.id, {
+              const response = await fetch('/api/statements/' + statement.id, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(statement.data)
               });
+              const result = await response.json();
+              if (result.dateValidation) {
+                statement.dateValidation = result.dateValidation;
+              }
 
               renderSegmentedControls();
               renderStatementList();
@@ -1917,6 +2019,9 @@ const generateHTML = (): string => {
                     const result = await response.json();
                     if (result.data) {
                       statement.data = result.data;
+                      if (result.dateValidation) {
+                        statement.dateValidation = result.dateValidation;
+                      }
                       render();
                       if (result.cost) {
                         showCostNotification('AI Scan cost: $' + result.cost);
@@ -2147,6 +2252,7 @@ const getMimeType = (path: string): string => {
 }
 
 const statements = loadStatements()
+computeDateValidation(statements)
 console.log(`Loaded ${statements.length} statements`)
 console.log(`  Valid: ${statements.filter((statement) => statement.data.validation.valid).length}`)
 console.log(`  Invalid: ${statements.filter((statement) => !statement.data.validation.valid).length}`)
@@ -2185,8 +2291,10 @@ const server = createServer((req, res) => {
       const jsonPath = join(BASE_PATH, statement.jsonPath)
       writeFileSync(jsonPath, JSON.stringify(data, null, 2) + '\n')
 
+      computeDateValidation(statements)
+
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ ok: true }))
+      res.end(JSON.stringify({ ok: true, dateValidation: statement.dateValidation }))
     })
     return
   }
@@ -2348,13 +2456,15 @@ Rules:
               const jsonPath = join(BASE_PATH, statement.jsonPath)
               writeFileSync(jsonPath, JSON.stringify(statement.data, null, 2) + '\n')
 
+              computeDateValidation(statements)
+
               const usage = response.usage || {}
               const inputCost = (usage.input_tokens || 0) * 0.000003
               const outputCost = (usage.output_tokens || 0) * 0.000015
               const totalCost = inputCost + outputCost
 
               res.writeHead(200, { 'Content-Type': 'application/json' })
-              res.end(JSON.stringify({ ok: true, data: statement.data, cost: totalCost.toFixed(4) }))
+              res.end(JSON.stringify({ ok: true, data: statement.data, dateValidation: statement.dateValidation, cost: totalCost.toFixed(4) }))
             } catch (err) {
               res.writeHead(200, { 'Content-Type': 'application/json' })
               res.end(JSON.stringify({ error: 'Failed to parse response: ' + (err as Error).message }))
