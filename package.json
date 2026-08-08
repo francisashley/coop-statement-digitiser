@@ -24,6 +24,6 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",
-    "pdfjs-dist": "^6.0.227"
+    "pdfjs-dist": "^6.2.108"
   }
 }
